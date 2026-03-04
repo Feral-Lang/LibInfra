@@ -5,436 +5,471 @@ let vec = import('std/vec');
 let result = import('std/result');
 let logging = import('std/logging');
 
-let SSHCon = struct(
-    remote = '',
-    port = '22',
-    user = nil, # optional
-    identityFile = nil, # optional
-    prefixCounter = 1 # internal variable to manage the `=` count in `=>>` prefix arrows
-);
-SSHCon.setTypeName('SSHCon');
+let ssh = import('ssh/ssh');
 
-let new = fn(remoteStr, port, .kw) {
-    let remote = remoteStr;
-    let user = '';
-    if remoteStr.find('@') >= 0 {
-        let split = remoteStr.split('@');
-        user = split[0];
-        remote = split[1];
+let Infra = struct(
+    ssh = nil,
+    chan = nil, # command execution channel
+    sftp = nil, # sftp session
+    distro = ''
+);
+Infra.setTypeName('Infra');
+
+let depth = 1;
+
+let pushDepth = fn() { ++depth; };
+let popDepth = fn() { --depth; };
+
+let ScopedDepth = struct();
+ScopedDepth.setTypeName('ScopedDepth');
+let _init_ in ScopedDepth = fn() { pushDepth(); };
+let _deinit_ in ScopedDepth = fn() { popDepth(); };
+
+let PathAttrs = struct(
+    name = '',
+    size = 0,
+    perms = 0,
+    mtime = 0,
+    owner = '',
+    uid = 0,
+    group = '',
+    gid = 0
+);
+PathAttrs.setTypeName('PathAttrs');
+
+############################################## Utils ##############################################
+
+let expect = fn(.kw, res, val = nil) {
+    let nl = ref(kw['nl']) ?? true;
+    if !res.isOk() {
+        if nl { io.cprintln('{r}failed{0}'); }
+        raise('error (', res.getVal().getCode(), '): ', res.getVal().getMsg());
     }
-    let idFile = kw['identityFile'] ?? nil;
-    return SSHCon(remote, port, user, idFile);
+    if val != nil && res.getVal() != val {
+        if nl { io.cprintln('{r}failed{0}'); }
+        raise('in result, expected `', val, '`, found `', res.getVal(), '`');
+    }
+    return res.getVal();
 };
 
-let getPrefix in SSHCon = fn() {
-    if self.prefixCounter == 1 {
+let prefix = fn() {
+    if depth == 1 {
         return '{bm}=>>';
-    } elif self.prefixCounter == 2 {
+    } elif depth == 2 {
         return '{bm}==>>';
-    } elif self.prefixCounter == 3 {
+    } elif depth == 3 {
         return '{bm}===>>';
-    } elif self.prefixCounter == 4 {
+    } elif depth == 4 {
         return '{bm}====>>';
-    } elif self.prefixCounter == 5 {
+    } elif depth == 5 {
         return '{bm}=====>>';
     }
-    return '{bm}' + ('=' * self.prefixCounter) + '>>';
+    return '{bm}' + ('=' * depth) + '>>';
 };
 
-let pushDepth in SSHCon = fn() { ++self.prefixCounter; };
-let popDepth in SSHCon = fn() { --self.prefixCounter; };
+############################################## Core ###############################################
 
-################################ High level helpers ###############################
+let new = fn(host, port = nil, user = nil) {
+    let conn = ssh.new();
+    io.cprint(prefix(), ' {y}connecting to remote {0}... ');
+    expect(conn.setOpt(ssh.OPT_HOST, host));
+    if port != nil { expect(conn.setOpt(ssh.OPT_PORT, port)); }
+    if user != nil { expect(conn.setOpt(ssh.OPT_USER, user)); }
+    expect(conn.connect());
+    expect(ssh.verifyKnownHost(conn));
+    expect(ssh.authenticate(conn));
+    let chan = expect(conn.openChannel());
+    let sftp = expect(conn.initSFTP());
+    io.cprintln('{g}connected{0}');
+    let obj = Infra(ref(conn), ref(chan), ref(sftp));
+    let _ = ScopedDepth();
+    obj.identifyDistro();
+    return obj;
+};
 
-let tryInstall in SSHCon = fn(.kw, localPath, path) {
-    if fs.isReg(localPath.path()) {
-        return self.tryInstallFrom(kw..., localPath, path);
+let install in Infra = fn(.kw, localPath, remotePath) {
+    if fs.isReg(localPath) {
+        return self.installFrom(kw..., localPath, remotePath);
     }
-    let items = fs.walkDir(localPath.path(), fs.WALK_RECURSE);
+    let items = fs.walkDir(localPath, fs.WALK_RECURSE);
     items.sort();
-    io.cprintln(self.getPrefix(), ' {by}Installing everything in {bc}', localPath, '{0}!');
+    io.cprintln(prefix(), ' {y}installing everything in {c}', localPath, '{0} ...');
     let installed = 0;
-    self.pushDepth();
+    ++depth;
     for itemPath in items.each() {
-        let item = itemPath.str();
-        if self.tryInstallFrom(kw..., item, path + item.replace(localPath, '')) { ++installed; }
+        if self.installFrom(kw..., itemPath, remotePath / (itemPath.relativeTo(localPath))) {
+            ++installed;
+        }
     }
-    self.popDepth();
+    --depth;
     if installed > 0 {
-        io.cprintln(self.getPrefix(), ' {bg}Installed {bc}', installed, '{0}/{bc}', items.len(), '{bg} items in {bc}', path, '{0}!');
+        io.cprintln(prefix(), ' {g}installed {c}', installed, '{0}/{c}', items.len(), ' {g}items in {c}', remotePath, '{0}');
         return true;
     }
-    io.cprintln(self.getPrefix(), ' {bg}All {bc}', items.len(), ' {bg}items are up to date in {bc}', path, '{0}!');
+    io.cprintln(prefix(), ' {g}all {c}', items.len(), ' {g}items are up to date in {c}', remotePath, '{0}');
     return false;
 };
 
-let tryInstallFrom in SSHCon = fn(.kw, localPath, path) {
-    let data = fs.fopen(localPath.path()).readAll().trim();
-    return self.tryInstallData(kw..., path, data);
+let installFrom in Infra = fn(.kw, localPath, remotePath) {
+    let data = fs.fopen(localPath).readAll().trim();
+    return self.installData(kw..., remotePath, data);
 };
 
-'
-Makes sure the file `path` has `data`.
-Optionally takes `exclusive = true` which ensures that `data` is the only thing in the file.
-'
-let tryInstallData in SSHCon = fn(.kw, path, dataTmp) {
-    let isDataExclusive = kw['exclusive'] ?? false;
-    let isDataTemplate = kw['templ'] ?? false;
-    inline if isDataTemplate {
+let installData in Infra = fn(.kw, remotePath, dataTmp) {
+    let isTrunc = kw['trunc'] ?? false;
+    let isTempl = kw['templ'] ?? false;
+    inline if isTempl {
         let data = os.applyEnv(dataTmp);
     } else {
         let data = ref(dataTmp);
     }
-    let parentDir = path.path().parent().str();
-    io.cprintln(self.getPrefix(), ' {by}Installing {bc}', path, ' {0}...');
-    self.pushDepth();
+    let parentDir = remotePath.parent();
+    io.cprintln(prefix(), ' {y}installing {c}', remotePath, '{0} ...');
+    ++depth;
     let updated = false;
-    if !self.tryExists(kw..., path) {
-        if !self.tryExists(kw..., parentDir) { self.tryMkdir(kw..., parentDir); }
-        self.tryWriteFile(kw..., path, data);
+    if !self.exists(kw..., remotePath) {
+        ++depth;
+        if !self.exists(kw..., parentDir) { self.mkdir(kw..., parentDir); }
+        --depth;
+        self.writeFile(kw..., remotePath, data);
         updated = true;
     } else {
-        let existingData = self.tryReadFile(kw..., path).join('\n').trim();
-        if (isDataExclusive && data != existingData) || (!isDataExclusive && existingData.find(data) < 0) {
-            if isDataExclusive {
-                self.tryWriteFile(kw..., path, data);
+        let existingData = self.readFile(kw..., remotePath);
+        if (isTrunc && data != existingData) || (!isTrunc && existingData.find(data) < 0) {
+            if isTrunc {
+                self.writeFile(kw..., remotePath, data);
             } else {
-                self.tryWriteFile(kw..., path, existingData + '\n' + data);
+                self.writeFile(kw..., existingData + '\n' + data);
             }
             updated = true;
         }
     }
-    self.popDepth();
+    --depth;
     if updated {
-        io.cprintln(self.getPrefix(), ' {bg}Installed {bc}', path, '{0}!');
+        io.cprintln(prefix(), ' {g}installed {c}', remotePath, '{0}');
     } else {
-        io.cprintln(self.getPrefix(), ' {bg}Already up to date {bc}', path, '{0}!');
+        io.cprintln(prefix(), ' {g}already up to date {c}', remotePath, '{0}');
     }
     return updated;
 };
 
-################################## Try Wrapppers ##################################
-
-# Helper
-let tryBegin in SSHCon = fn(withNewLine, msg...) {
-    io.cprint(self.getPrefix(), ' {by}', msg..., ' {0}... ');
-    if withNewLine { io.cprintln(); }
-};
-
-# Helper
-let tryEnd in SSHCon = fn(res, onNewline, msg...) {
-    if onNewline && msg != nil {
-        io.cprint(self.getPrefix(), ' ');
-    }
-    if !res.isOk() {
-        let failed = 'failed';
-        if onNewline { failed = 'Failed'; }
-        io.cprintln('{r}', failed, '{0}: {c}', res.getVal().getMsg(), '{0}!');
-        feral.exit(res.getVal().getCode());
-    }
-    if msg != nil && !msg.empty() {
-        io.cprint('{bg}');
-        for m in msg.each() {
-            if m._type_() == FuncTy {
-                io.cprint(m(res.getVal()));
-            } else {
-                io.cprint(m);
-            }
+let getEnv in Infra = fn(.kw, var) {
+    let show = kw['show'] ?? true;
+    if show { io.cprint(prefix(), ' {y}getting env variable {c}', var, ' {0}... '); }
+    let val = '';
+    expect(self.exec(kw..., 'echo $' + var, out = val), 0);
+    if show {
+        if !val.empty() {
+            io.cprintln('{g}', val, '{0}');
+        } else {
+            io.cprintln('{r}not found{0}');
         }
-        io.cprintln('{0}!');
-    } elif !onNewline {
-        io.cprintln();
     }
-    return ref(res.getVal());
+    return val;
 };
 
-let tryConnect in SSHCon = fn(.kw) {
-    self.tryBegin(false, 'Connecting to remote');
-    let res = self.tryEnd(self.connect(kw...), false, 'success');
-    return ref(res);
-};
-
-let tryGetEnv in SSHCon = fn(.kw, varName) {
-    self.tryBegin(false, 'Getting env var{0}: {bc}', varName);
-    let res = self.tryEnd(self.getEnv(kw..., varName), false, 'success');
-    return ref(res);
-};
-
-let tryCopyFromRemote in SSHCon = fn(.kw, srcPath, destPath) {
-    let conStr = self.getConStr();
-    return ref(self.tryCopy(kw..., conStr + ':' + srcPath, destPath));
-};
-
-let tryCopyToRemote in SSHCon = fn(.kw, srcPath, destPath) {
-    let conStr = self.getConStr();
-    return ref(self.tryCopy(kw..., srcPath, conStr + ':' + destPath));
-};
-
-let tryCopyInRemote in SSHCon = fn(.kw, srcPath, destPath) {
-    let conStr = self.getConStr();
-    return ref(self.tryCopy(kw..., conStr + ':' + srcPath, conStr + ':' + destPath));
-};
-
-let trySymLink in SSHCon = fn(.kw, srcPath, destPath) {
-    io.cprintln(self.getPrefix(), ' {by}Symlinking to{0}: {bc}', destPath);
-    self.pushDepth();
-    if !self.tryExists(destPath) {
-        self.tryBegin(false, 'Creating link{0}: {bc}', destPath, ' {by}-> {bc}', srcPath);
-        let res = self.tryEnd(self.symLink(kw..., srcPath, destPath), false, 'success');
-        self.popDepth();
-        return ref(res);
-    }
-    self.popDepth();
-    io.cprintln(self.getPrefix(), ' {bg}Symlink already exists{0}!');
-    return result.ok();
-};
-
-let tryRemove in SSHCon = fn(.kw, items...) {
-    self.tryBegin(false, 'Deleting{0}: {bc}', items.join('{0}, {bc}'));
-    let res = self.tryEnd(self.remove(kw..., items...), false, 'success');
-    return ref(res);
-};
-
-let tryMkdir in SSHCon = fn(.kw, items...) {
-    self.tryBegin(false, 'Creating directories{0}: {bc}', items.join('{0}, {bc}'));
-    let res = self.tryEnd(self.mkdir(kw..., items...), false, 'success');
-    return ref(res);
-};
-
-let tryExists in SSHCon = fn(.kw, item) {
-    self.tryBegin(false, 'Checking if path exists{0}: {bc}', item);
-    let res = self.tryEnd(self.exists(kw..., item), false, fn(val) { return val ? 'yes' : 'no'; });
-    return ref(res);
-};
-
-let tryReadFile in SSHCon = fn(.kw, path) {
-    self.tryBegin(false, 'Reading file{0}: {bc}', path);
-    let res = self.tryEnd(self.readFile(kw..., path), false, 'success');
-    return ref(res);
-};
-
-let tryWriteFile in SSHCon = fn(.kw, path, data) {
-    self.tryBegin(false, 'Writing data to file{0}: {bc}', path);
-    let res = self.tryEnd(self.writeFile(kw..., path, data), false, 'success');
-    return ref(res);
-};
-
-let tryAppendFile in SSHCon = fn(.kw, path, data) {
-    self.tryBegin(false, 'Appending data to file{0}: {bc}', path);
-    let res = self.tryEnd(self.appendFile(kw..., path, data), false, 'success');
-    return ref(res);
-};
-
-let tryDownload in SSHCon = fn(.kw, url, destPath) {
-    self.tryBegin(false, 'Downloading{0}: {bc}', destPath);
-    let res = self.tryEnd(self.download(kw..., url, destPath), false, 'success');
-    return ref(res);
-};
-
-let tryRun in SSHCon = fn(.kw, cmd...) {
-    let newLine = true;
-    let finishMsg = 'Success';
-    if kw['out'] != nil { newLine = false; finishMsg = 'success'; }
-    let desc = 'Running command{0}: {bc}' + cmd.join(' ');
-    if kw['desc'] != nil { desc = kw['desc']; }
-    self.tryBegin(newLine, desc);
-    let res = self.tryEnd(self.run(kw..., cmd...), newLine, finishMsg);
-    return ref(res);
-};
-
-let tryCopy in SSHCon = fn(.kw, src, dest) {
-    self.tryBegin(false, 'Copying{0}: {bc}', src, ' {by}-> ', '{bc}', dest);
-    let res = self.tryEnd(self.copy(kw..., src, dest), false, 'success');
-    return ref(res);
-};
-
-################################# Core Functions ##################################
-
-let connect in SSHCon = fn(.kw) {
-    let out = '';
-    return self.run(kw..., out = out, 'echo', 'test');
-};
-
-let getEnv in SSHCon = fn(.kw, varName) {
-    let out = '';
-    let res = self.run(kw..., out = out, 'echo', '\\$' + varName);
-    return res.isOk() ? result.ok(out) : res;
-};
-
-let copyFromRemote in SSHCon = fn(.kw, srcPath, destPath) {
-    let conStr = self.getConStr();
-    return self.copy(kw..., conStr + ':' + srcPath, destPath);
-};
-
-let copyToRemote in SSHCon = fn(.kw, srcPath, destPath) {
-    let conStr = self.getConStr();
-    return self.copy(kw..., srcPath, conStr + ':' + destPath);
-};
-
-let copyInRemote in SSHCon = fn(.kw, srcPath, destPath) {
-    let conStr = self.getConStr();
-    return self.copy(kw..., conStr + ':' + srcPath, conStr + ':' + destPath);
-};
-
-let symLink in SSHCon = fn(.kw, srcPath, destPath) {
-    let out = '';
-    let res = self.run(kw..., out = out, 'ln', '-sf', srcPath, destPath);
-    return res.isOk() ? result.ok() : res;
-};
-
-let remove in SSHCon = fn(.kw, items...) {
-    return self.run(kw..., 'rm', '-rf', items...);
-};
-
-let mkdir in SSHCon = fn(.kw, items...) {
-    return self.run(kw..., 'mkdir', '-p', items...);
-};
-
-let exists in SSHCon = fn(.kw, item) {
-    let out = '';
-    let res = self.run(kw..., out = out, 'test', '-e', item, '&&', 'echo', 'yes', '||', 'echo', 'no');
-    if res.isOk() { return result.ok(out == 'yes' ? true : false); }
-    return res;
-};
-
-let readFile in SSHCon = fn(.kw, path) {
-    let out = vec.new(refs = true);
-    let res = self.run(kw..., out = out, 'cat', path);
-    return res.isOk() ? result.ok(out) : res;
-};
-
-let writeFile in SSHCon = fn(.kw, path, data) {
-    let tmpFile = feral.tempPath.str() + '/remoteWrite-' + path.replace('/', '-');
-    io.fprint(fs.fopen(tmpFile.path(), 'w+'), data);
-    let res = self.copyToRemote(kw..., tmpFile, path);
-    fs.remove(tmpFile.path());
-    return res;
-};
-
-let appendFile in SSHCon = fn(.kw, path, data) {
-    let tmpFile = feral.tempPath.str() + 'remoteAppend-' + path.replace('/', '-');
-    logging.debug('Appending using temp file: ', tmpFile);
-    let res = self.readFile(kw..., path);
-    if res.isOk() {
-        let f = fs.fopen(tmpFile.path(), 'w+');
-        io.fprint(f, res.getVal().join('\n'), '\n', data);
-    } else {
-        let f = fs.fopen(tmpFile.path(), 'w+');
-        io.fprint(f, data);
-    }
-    let res = self.copyToRemote(kw..., tmpFile, path);
-    fs.remove(tmpFile.path());
-    return res;
-};
-
-let download in SSHCon = fn(.kw, url, destPath) {
-    let out = '';
-    return self.run(kw..., out = out, 'curl', '-sL', '-o', destPath, url);
-};
-
-let run in SSHCon = fn(.kw, command...) {
-    if self.remote.empty() {
-        logging.fatal('No remote provided!');
-        return result.err(1, 'No remote provided!');
-    }
-    let output = ref(kw['out']);
-    let sudo = kw['sudo'] ?? false;
-    let conStr = self.getConStr();
-    let cmd = vec.new(refs = true, 'ssh', conStr, '-p', self.port);
-    if self.identityFile != nil {
-        cmd.push('-i', self.identityFile);
-    }
-    if sudo { cmd.push('sudo'); }
-    cmd.append(command);
-    cmd.push('^2>&1');
-    logging.debug('Command: ', cmd.join(' '));
-    let e = os.exec(cmd, out = output);
-    if e != 0 {
-        logging.fatal('Command failed!');
-        if output != nil {
-            return result.err(e, output);
+let exists in Infra = fn(.kw, path) {
+    let show = kw['show'] ?? true;
+    if show { io.cprint(prefix(), ' {y}checking if path {c}', path, ' {y}exists', ' {0}... '); }
+    let val = expect(self.exec(kw..., 'test', '-e', path.str(), '||', 'test', '-L', path.str())) == 0;
+    if show {
+        if val {
+            io.cprintln('{g}yes{0}');
+        } else {
+            io.cprintln('{r}no{0}');
         }
-        return result.err(e, 'Command failed');
     }
-    logging.debug('Command successful!');
-    if output != nil {
-        logging.debug('Output: ', output);
-    }
-    return result.ok();
+    return val;
 };
 
-let copy in SSHCon = fn(.kw, src, dest) {
-    if self.remote.empty() {
-        logging.fatal('No remote provided!');
-        return result.err(1, 'No remote provided!');
-    }
-    let sudo = kw['sudo'] ?? false;
-    let skipLen = self.remote.len() + 1; # 1 for colon
-    let srcRemote = src.find(self.remote + ':');
-    let destRemote = dest.find(self.remote + ':');
-    let scpCmd = vec.new(refs = true);
-    if srcRemote >= 0 && destRemote >= 0 {
-        # just regular (sudo) cp
-        return self.run(kw..., out = out, desc = 'Copying within remote', 'cp', '-r', src.sub(srcRemote + 1), dest.sub(destRemote + 1));
-    } elif srcRemote >= 0 {
-        # (sudo cp from remote src to remote tmp)
-        # scp from remote tmp/src to local dest
-        let localSrc = src.sub(srcRemote + skipLen);
-        let localTmp = '/tmp/' + localSrc.replace('/', '@@');
-        if sudo {
-            let out = '';
-            let res = self.run(kw..., out = out, desc = 'Copying to temp file', 'cp', '-r', localSrc, localTmp);
-            if !res.isOk() { return ref(res); }
-            out = '';
-            let res = self.run(kw..., out = out, desc = 'Updating temp file permissions', 'chmod', '-R', '+rx', localTmp);
-            if !res.isOk() { return ref(res); }
-            localSrc = localTmp;
+let isFile in Infra = fn(.kw, path) {
+    let show = kw['show'] ?? true;
+    if show { io.cprint(prefix(), ' {y}checking if path {c}', path, ' {y}is a file', ' {0}... '); }
+    let val = expect(self.exec(kw..., 'test', '-f', path.str())) == 0;
+    if show {
+        if val {
+            io.cprintln('{g}yes{0}');
+        } else {
+            io.cprintln('{r}no{0}');
         }
-        let res = self.scp(self.getConStr() + ':' + localSrc, dest);
-        if !sudo || !res.isOk() { return res; }
-        return self.remove(kw..., localTmp);
     }
-    # scp from local src to remote tmp/dest
-    # (sudo cp from remote tmp to remote dest)
-    let localDest = dest.sub(destRemote + skipLen);
-    let tmpDest = localDest;
+    return val;
+};
+
+let isDir in Infra = fn(.kw, path) {
+    let show = kw['show'] ?? true;
+    if show { io.cprint(prefix(), ' {y}checking if path {c}', path, ' {y}is a dir', ' {0}... '); }
+    let val = expect(self.exec(kw..., 'test', '-d', path.str())) == 0;
+    if show {
+        if val {
+            io.cprintln('{g}yes{0}');
+        } else {
+            io.cprintln('{r}no{0}');
+        }
+    }
+    return val;
+};
+
+let readFile in Infra = fn(.kw, path) {
+    let show = kw['show'] ?? true;
+    let sudo = kw['su'] ?? false;
+    let tmpPath = path.str();
+    let isReadingTmp = '';
     if sudo {
-        tmpDest = '/tmp/' + tmpDest.replace('/', '@@');
+        let _ = ScopedDepth();
+        tmpPath = '/tmp/tmpRead-' + tmpPath.replace('/', '@--@');
+        self.copy(kw..., show = false, path, tmpPath);
+        self.chmod(kw..., show = false, tmpPath, '+rx');
+        isReadingTmp = ' temp';
     }
-    let res = self.scp(src, self.getConStr() + ':' + tmpDest);
-    if !sudo || !res.isOk() { return res; }
-    let out = '';
-    let res = self.run(kw..., out = out, desc = 'Copying from temp file', 'cp', '-r', tmpDest, localDest);
-    if !res.isOk() { return res; }
-    return self.remove(kw..., tmpDest);
+    if show { io.cprint(prefix(), ' {y}reading', isReadingTmp, ' file {c}', tmpPath, ' {0}... '); }
+    let f = self.sftp.openFile(tmpPath);
+    let data = expect(self.sftp.readFile(f)).trim();
+    expect(f.close());
+    if show { io.cprintln('{c}', data.len(), ' {g}bytes{0}'); }
+    if sudo {
+        let _ = ScopedDepth();
+        self.remove(kw..., tmpPath);
+    }
+    return data;
 };
 
-let scp in SSHCon = fn(src, dest) {
-    let cmd = vec.new(refs = true, 'scp', '-P', self.port);
-    if self.identityFile != nil {
-        cmd.push('-i', self.identityFile);
+let writeFile in Infra = fn(.kw, path, data, perms = 0640) {
+    let show = kw['show'] ?? true;
+    let sudo = kw['su'] ?? false;
+    let append = kw['append'] ?? false;
+
+    let tmpPath = path.str();
+    if sudo {
+        tmpPath = '/tmp/tmpWrite-' + tmpPath.replace('/', '@--@');
+        if show { io.cprint(prefix(), ' {y}writing data to temp file {c}', tmpPath, ' {0}... '); }
+    } else {
+        if show { io.cprint(prefix(), ' {y}writing data to file {c}', tmpPath, ' {0}... '); }
     }
-    cmd.push('-r', src, dest, '^2>&1');
-    logging.debug('Copying: ', cmd.join(' '));
-    let output = '';
-    let e = os.exec(cmd, out = output);
-    if e != 0 {
-        logging.fatal('Copying failed!');
-        return result.err(e, 'Copying failed: ', output);
+    let openFlags = fs.O_CREAT | fs.O_WRONLY;
+    if append { openFlags |= fs.O_APPEND; }
+    let f = self.sftp.openFile(tmpPath, openFlags, perms);
+    let writtenBytes = expect(self.sftp.writeFile(f, data));
+    expect(f.close());
+    if show { io.cprintln('{c}', writtenBytes, ' {g}bytes{0}'); }
+    if sudo {
+        let _ = ScopedDepth();
+        if append {
+            self.cat(kw..., tmpPath, path);
+            self.remove(kw..., tmpPath);
+        } else {
+            self.move(kw..., tmpPath, path);
+        }
     }
-    logging.debug('Copying successful!');
-    return result.ok();
+    return writtenBytes;
 };
 
-let getConStr in SSHCon = fn() {
-    let conStr = '';
-    if self.user != nil && !self.user.empty() {
-        conStr += self.user + '@';
-    }
-    conStr += self.remote;
-    return conStr;
+let appendFile in Infra = fn(.kw, path, data, perms = 0640) {
+    return self.writeFile(kw..., append = true, path, data, perms);
 };
 
-let str in SSHCon = fn() {
-    return self.getConStr();
+let walkDir in Infra = fn(.kw, path, regex = '', recursive = true) {
+    let show = kw['show'] ?? true;
+    let dirOnly = kw['dirOnly'] ?? false;
+    let fileOnly = kw['fileOnly'] ?? false;
+    let exists = self.exists(kw..., show = false, path);
+    if !exists {
+        expect(nl = false, result.err(-1, 'path doesn\'t exist'));
+    }
+    let cmd = 'find ' + path.str();
+    if !recursive {
+        cmd += ' -maxdepth 1';
+    }
+    if !regex.empty() {
+        cmd += ' -path "' + regex + '"';
+    }
+    if show { io.cprint(prefix(), ' {y}getting entries in {c}', path, ' {0}... '); }
+    let entries = vec.new(refs = true);
+    let entriesStr = '';
+    expect(self.exec(kw..., out = entriesStr, cmd), 0);
+    for e in entriesStr.split('\n').each() {
+        if e == path.str() { continue; }
+        if fileOnly && !self.isFile(show = false, e) { continue; }
+        if dirOnly && !self.isDir(show = false, e) { continue; }
+        entries.push(e.path());
+    }
+    if show { io.cprintln('{c}', entries.len(), ' {g}found{0}'); }
+    return entries;
 };
+
+let stat in Infra = fn(.kw, path) {
+    let show = kw['show'] ?? true;
+    if show { io.cprint(prefix(), ' {y}getting stat info for {c}', path, ' {0}... '); }
+    let exists = self.exists(kw..., show = false, path);
+    if !exists {
+        expect(nl = false, result.err(-1, 'path doesn\'t exist'));
+    }
+    let statDataStr = self.execOut(kw..., 'stat', '--format="%n %s %a %Y %U %u %G %g"', path.str());
+    let st = statDataStr.split(' ');
+    if show { io.cprintln('{g}found{0}'); }
+    return PathAttrs(st[0], st[1].int(), st[2].int(8), st[3].int(), st[4], st[5].int(), st[6], st[7].int());
+};
+
+let mkdir in Infra = fn(.kw, paths...) {
+    let show = kw['show'] ?? true;
+    for path in paths.each() {
+        if show { io.cprint(prefix(), ' {y}creating directory {c}', path, ' {0}... '); }
+        let exists = self.exists(kw..., show = false, path);
+        if exists {
+            if show { io.cprintln('{g}already exists{0}'); }
+            continue;
+        }
+        let res = self.exec(kw..., 'mkdir -p ' + path.str());
+        expect(res, 0);
+        if show { io.cprintln('{g}done{0}'); }
+    }
+};
+
+let mklink in Infra = fn(.kw, src, dest) {
+    let show = kw['show'] ?? true;
+    if show { io.cprint(prefix(), ' {y}linking {c}', src, ' {0}-> {c}', dest, ' {0}... '); }
+    expect(self.exec(kw..., 'ln', '-sf', src.str(), dest.str()), 0);
+    if show { io.cprintln('{g}done{0}'); }
+};
+
+let remove in Infra = fn(.kw, paths...) {
+    let show = kw['show'] ?? true;
+    for path in paths.each() {
+        if show { io.cprint(prefix(), ' {y}removing path {c}', path, ' {0}... '); }
+        let exists = self.exists(kw..., show = false, path);
+        if !exists {
+            if show { io.cprintln('{g}doesn\'t exist{0}'); }
+            continue;
+        }
+        expect(self.exec(kw..., 'rm -rf ' + path.str()), 0);
+        if show { io.cprintln('{g}done{0}'); }
+    }
+};
+
+let copy in Infra = fn(.kw, src, dest) {
+    let show = kw['show'] ?? true;
+    if show { io.cprint(prefix(), ' {y}copying {c}', src, ' {0}-> {c}', dest, ' {0}... '); }
+    expect(self.exec(kw..., 'cp', '-r', src.str(), dest.str()), 0);
+    if show { io.cprintln('{g}done{0}'); }
+};
+
+let move in Infra = fn(.kw, src, dest) {
+    let show = kw['show'] ?? true;
+    if show { io.cprint(prefix(), ' {y}moving {c}', src, ' {0}-> {c}', dest, ' {0}... '); }
+    expect(self.exec(kw..., 'mv', src.str(), dest.str()), 0);
+    if show { io.cprintln('{g}done{0}'); }
+};
+
+let chmod in Infra = fn(.kw, path, perms) {
+    let show = kw['show'] ?? true;
+    if show { io.cprint(prefix(), ' {y}changing perms for {c}', path, ' {0}... '); }
+    expect(self.exec(kw..., 'chmod', '-R', perms, path.str()), 0);
+    if show { io.cprintln('{g}done{0}'); }
+};
+
+let cat in Infra = fn(.kw, src, dest) {
+    let show = kw['show'] ?? true;
+    if show { io.cprint(prefix(), ' {y}appending {c}', src, ' {0}-> {c}', dest, ' {0}... '); }
+    expect(self.exec(kw..., 'cat', src.str(), '>>', dest.str()), 0);
+    if show { io.cprintln('{g}done{0}'); }
+};
+
+let download in Infra = fn(.kw, url, dest) {
+    let show = kw['show'] ?? true;
+    if show { io.cprint(prefix(), ' {y}downloading to {c}', dest, ' {0}... '); }
+    expect(self.exec(kw..., 'curl', '-sL', '-o', dest.str(), url), 0);
+    if show { io.cprintln('{g}done{0}'); }
+};
+
+let identifyDistro in Infra = fn(.kw) {
+    let show = kw['show'] ?? true;
+    if show { io.cprint(prefix(), ' {y}identifying distro {0}... '); }
+    let releaseOut = self.execOut(kw..., show = false, 'cat', '/etc/*-release');
+    self.distro = 'unknown';
+    if releaseOut.find('arch') >= 0 {
+        self.distro = 'arch';
+    } elif releaseOut.find('ubuntu') >= 0 {
+        self.distro = 'ubuntu';
+    } elif releaseOut.find('debian') >= 0 {
+        self.distro = 'debian';
+    } elif releaseOut.find('gentoo') >= 0 {
+        self.distro = 'gentoo';
+    } elif releaseOut.find('centos') >= 0 {
+        self.distro = 'centos';
+    } elif releaseOut.find('suse') >= 0 {
+        self.distro = 'suse';
+    }
+    if show {
+        if self.distro == 'unknown' {
+            io.cprintln('{r}', self.distro, '{0}');
+        } else {
+            io.cprintln('{g}', self.distro, '{0}');
+        }
+    }
+};
+
+let installPackages in Infra = fn(.kw, packages...) {
+    let show = kw['show'] ?? true;
+    let pkgCmd = '';
+    if self.distro == 'arch' {
+        pkgCmd = 'pacman -S --needed --noconfirm';
+    } elif self.distro == 'ubuntu' || self.distro == 'debian' {
+        pkgCmd = 'apt install -y';
+    }
+    if pkgCmd.empty() {
+        raise('unknown package command for distro: ', self.distro);
+    }
+    if show { io.cprintln(prefix(), ' {y}installing packages {c}', packages.join('{0}, {c}'), ' {0}... '); }
+    expect(nl = false, self.exec(kw..., pkgCmd, packages...), 0);
+    if show { io.cprintln(prefix(), ' {g}installation completed{0}'); }
+};
+
+let updatePackages in Infra = fn(.kw) {
+    let show = kw['show'] ?? true;
+    let pkgCmd = '';
+    if self.distro == 'arch' {
+        pkgCmd = 'pacman -Syu --noconfirm';
+    } elif self.distro == 'ubuntu' || self.distro == 'debian' {
+        pkgCmd = 'apt update && apt upgrade';
+    }
+    if pkgCmd.empty() {
+        raise('unknown package command for distro: ', self.distro);
+    }
+    if show { io.cprintln(prefix(), ' {y}Updating packages {0}... '); }
+    expect(nl = false, self.exec(kw..., pkgCmd), 0);
+    if show { io.cprintln(prefix(), ' {g}installation completed{0}'); }
+};
+
+let run in Infra = fn(.kw, command...) {
+    let desc = ref(kw['desc']);
+    let out = ref(kw['out']);
+    if desc != nil {
+        io.cprint(prefix(), ' {y}', desc, ' {0}... ');
+        if out == nil { io.cprintln(); }
+    }
+    expect(nl = out != nil, self.exec(kw..., command...), 0);
+    if desc != nil {
+        if out == nil { io.cprint(prefix(), ' '); }
+        io.cprintln('{g}done{0}');
+    }
+};
+
+let exec in Infra = fn(.kw, command...) {
+    let sudo = kw['su'];
+    let cmd = '';
+    if sudo {
+        cmd += 'sudo su - -c \'';
+    }
+    cmd += command.join(' ');
+    if sudo { cmd += '\''; }
+    logging.trace('executing command: ', cmd);
+    return self.chan.exec(kw..., cmd);
+};
+
+let execOut in Infra = fn(.kw, command...) {
+    let val = '';
+    expect(self.exec(kw..., out = val, command...), 0);
+    return val;
+};
+
+let getDistro in Infra = fn() { return self.distro; };

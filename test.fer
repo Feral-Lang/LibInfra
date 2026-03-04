@@ -1,6 +1,7 @@
 let io = import('std/io');
 let fs = import('std/fs');
 let os = import('std/os');
+let vec = import('std/vec');
 let logging = import('std/logging');
 let argparse = import('std/argparse');
 
@@ -9,37 +10,75 @@ let infra = import('infra/infra');
 let args = argparse.new(feral.args);
 args.addArg('trace').addOpts('--trace', '-T').setHelp('Show trace output');
 args.addArg('host').setValReqd(true).setReqd(true).setHelp('Hostname to connect to');
-args.addArg('port').setValReqd(true).setReqd(true).setHelp('Port on the host to connect to');
+args.addArg('port').setValReqd(true).setHelp('Port on the host to connect to');
 args.parse();
 
 if args.has('trace') {
     logging.addTarget(io.stderr, logging.Levels.TRACE);
 }
 
-let conn = infra.new(args.getValue('host'), args.getValue('port'));
+let port = args.has('port') ? args.getValue('port').int() : nil;
 
-conn.tryConnect();
-let remoteHome = conn.tryGetEnv('HOME');
-conn.tryCopyFromRemote(sudo = true, '/bin/bash', './bash');
-fs.remove('./bash'.path());
-let remoteHosts = conn.tryReadFile('/etc/hosts').join('\n');
+let conn = infra.new(args.getValue('host'), port);
+
+let userHome = conn.getEnv('HOME');
+let rootHome = conn.getEnv(su = true, 'HOME');
+let homes = vec.new(refs = true, userHome, rootHome);
+
+let zshrc = userHome / '.zshrc';
+let zshrcExists = conn.exists(zshrc);
+let data = conn.readFile(zshrc);
+io.println('------------------------------ ~/.zshrc ------------------------------');
+io.println(data);
+io.println('----------------------------------------------------------------------');
+let zshrcTmp = userHome / '.zshrcTmp';
+let writtenBytes = conn.writeFile(zshrcTmp, data);
+conn.mkdir(userHome / 'tmpDir');
+conn.remove(zshrcTmp, userHome / 'tmpDir');
+let writtenBytes = conn.writeFile(su = true, rootHome / '.zshrcTmp', data);
+conn.remove(su = true, rootHome / '.zshrcTmp');
+let remoteHostsData = conn.readFile('/etc/hosts');
 io.println('-------------------------------------------------------');
 io.cprintln('{by}Contents of {bc}/etc/hosts{0}:');
 io.println('----------');
-io.println(remoteHosts);
+io.println(remoteHostsData);
 io.println('----------');
 io.println('-------------------------------------------------------');
-conn.tryWriteFile(remoteHome + '/testHosts', remoteHosts);
-conn.tryAppendFile(remoteHome + '/testHosts', '123.123.123.123 helloooooo');
-remoteHosts = conn.tryReadFile(remoteHome + '/testHosts').join('\n');
-io.println('-------------------------------------------------------');
-io.cprintln('{by}Contents of {bc}', remoteHome, '/testHosts{0}:');
-io.println('----------');
-io.println(remoteHosts);
-io.println('----------');
-io.println('-------------------------------------------------------');
-conn.trySymLink(remoteHome + '/testHosts', remoteHome + '/testHosts2');
-conn.tryRemove(remoteHome + '/testHosts', remoteHome + '/testHosts2');
-conn.tryDownload('https://google.com', remoteHome + '/testDownload.html');
-conn.tryExists(remoteHome + '/.bashrc');
-conn.tryRemove(remoteHome + '/testDownload.html');
+for home in homes.each() {
+    let _ = infra.ScopedDepth();
+    let su = home.find('root') >= 0;
+    conn.writeFile(su = su, home / 'testHosts', remoteHostsData);
+    conn.appendFile(su = su, home / 'testHosts', '\n123.123.123.123 helloooooo');
+    remoteHostsData = conn.readFile(su = su, home / 'testHosts');
+    io.println('-------------------------------------------------------');
+    io.cprintln('{by}Contents of {bc}', home, '/testHosts{0}:');
+    io.println('----------');
+    io.println(remoteHostsData);
+    io.println('----------');
+    io.println('-------------------------------------------------------');
+    conn.mklink(su = su, home / 'testHosts', home / 'testHosts2');
+    conn.remove(su = su, home / 'testHosts', home / 'testHosts2');
+}
+
+let zshrcStat = conn.stat(zshrc);
+io.println('zshrc stat: ', zshrcStat);
+
+let entries = conn.walkDir(userHome / 'docker', '*\\.yml');
+entries.sort();
+for e in entries.each() {
+    io.println(e);
+}
+
+#################################### install ####################################
+
+let localPath = __SRC_DIR__ / 'include';
+let remotePath = userHome / 'include';
+
+conn.install(trunc = true, localPath, remotePath);
+conn.install(trunc = true, localPath, remotePath);
+conn.remove(userHome / 'include');
+
+################################### download ####################################
+
+conn.download('https://google.com', userHome / 'testDownload.html');
+conn.remove(userHome / 'testDownload.html');

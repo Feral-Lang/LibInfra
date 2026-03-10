@@ -2,6 +2,7 @@ let io = import('std/io');
 let fs = import('std/fs');
 let os = import('std/os');
 let vec = import('std/vec');
+let json = import('std/json');
 let result = import('std/result');
 let logging = import('std/logging');
 
@@ -136,11 +137,7 @@ let installData in Infra = fn(.kw, remotePath, dataTmp) {
     } else {
         let existingData = self.readFile(kw..., remotePath);
         if (isTrunc && data != existingData) || (!isTrunc && existingData.find(data) < 0) {
-            if isTrunc {
-                self.writeFile(kw..., remotePath, data);
-            } else {
-                self.writeFile(kw..., existingData + '\n' + data);
-            }
+            self.writeFile(kw..., remotePath, data);
             updated = true;
         }
     }
@@ -237,7 +234,7 @@ let readFile in Infra = fn(.kw, path) {
 let writeFile in Infra = fn(.kw, path, data, perms = 0640) {
     let show = kw['show'] ?? true;
     let sudo = kw['su'] ?? false;
-    let append = kw['append'] ?? false;
+    let isTrunc = kw['trunc'] ?? false;
 
     let tmpPath = path.str();
     if sudo {
@@ -247,18 +244,19 @@ let writeFile in Infra = fn(.kw, path, data, perms = 0640) {
         if show { io.cprint(prefix(), ' {y}writing data to file {c}', tmpPath, ' {0}... '); }
     }
     let openFlags = fs.O_CREAT | fs.O_WRONLY;
-    if append { openFlags |= fs.O_APPEND; }
+    if isTrunc { openFlags |= fs.O_TRUNC; }
+    else { openFlags |= fs.O_APPEND; }
     let f = self.sftp.openFile(tmpPath, openFlags, perms);
     let writtenBytes = expect(self.sftp.writeFile(f, data));
     expect(f.close());
     if show { io.cprintln('{c}', writtenBytes, ' {g}bytes{0}'); }
     if sudo {
         let _ = ScopedDepth();
-        if append {
+        if isTrunc {
+            self.move(kw..., tmpPath, path);
+        } else {
             self.cat(kw..., tmpPath, path);
             self.remove(kw..., tmpPath);
-        } else {
-            self.move(kw..., tmpPath, path);
         }
     }
     return writtenBytes;
@@ -372,6 +370,16 @@ let cat in Infra = fn(.kw, src, dest) {
     if show { io.cprint(prefix(), ' {y}appending {c}', src, ' {0}-> {c}', dest, ' {0}... '); }
     expect(self.exec(kw..., 'cat', src.str(), '>>', dest.str()), 0);
     if show { io.cprintln('{g}done{0}'); }
+};
+
+let getIP in Infra = fn(.kw) {
+    let show = kw['show'] ?? true;
+    if show { io.cprint(prefix(), ' {y}fetching ip address {0}... '); }
+    let output = self.execOut(kw..., 'ip', '-json', 'route', 'get', '1.1.1.1');
+    let js = json.loads(output);
+    let ip = js[0]['prefsrc'];
+    if show { io.cprintln('{g}', ip, '{0}'); }
+    return ip;
 };
 
 let download in Infra = fn(.kw, url, dest) {

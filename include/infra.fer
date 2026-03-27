@@ -70,12 +70,13 @@ let prefix = fn() {
 
 ############################################## Core ###############################################
 
-let new = fn(host, port = nil, user = nil) {
+let new = fn(host, port = nil, user = nil, identityFile = nil) {
     let conn = ssh.new();
     io.cprint(prefix(), ' {y}connecting to remote {0}... ');
     expect(conn.setOpt(ssh.OPT_HOST, host));
     if port != nil { expect(conn.setOpt(ssh.OPT_PORT, port)); }
     if user != nil { expect(conn.setOpt(ssh.OPT_USER, user)); }
+    if identityFile != nil { expect(conn.setOpt(ssh.OPT_IDENTITY, identityFile.str())); }
     expect(conn.connect());
     expect(ssh.verifyKnownHost(conn));
     expect(ssh.authenticate(conn));

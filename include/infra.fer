@@ -70,12 +70,13 @@ let prefix = fn() {
 
 ############################################## Core ###############################################
 
-let new = fn(host, port = nil, user = nil) {
+let new = fn(host, port = nil, user = nil, identityFile = nil) {
     let conn = ssh.new();
     io.cprint(prefix(), ' {y}connecting to remote {0}... ');
     expect(conn.setOpt(ssh.OPT_HOST, host));
     if port != nil { expect(conn.setOpt(ssh.OPT_PORT, port)); }
     if user != nil { expect(conn.setOpt(ssh.OPT_USER, user)); }
+    if identityFile != nil { expect(conn.setOpt(ssh.OPT_IDENTITY, identityFile.str())); }
     expect(conn.connect());
     expect(ssh.verifyKnownHost(conn));
     expect(ssh.authenticate(conn));
@@ -113,10 +114,16 @@ let install in Infra = fn(.kw, localPath, remotePath) {
 
 let installFrom in Infra = fn(.kw, localPath, remotePath) {
     let data = fs.fopen(localPath).readAll().trim();
-    return self.installData(kw..., remotePath, data);
+    let perms = '';
+    if os.name == 'macos' {
+        os.exec(out = perms, 'stat', '-f', '"%A"', localPath.str());
+    } elif os.name != 'windows' {
+        os.exec(out = perms, 'stat', '-c', '"%a"', localPath.str());
+    }
+    return self.installData(kw..., remotePath, data, perms);
 };
 
-let installData in Infra = fn(.kw, remotePath, dataTmp) {
+let installData in Infra = fn(.kw, remotePath, dataTmp, perms = '') {
     let isTrunc = kw['trunc'] ?? false;
     let isTempl = kw['templ'] ?? false;
     inline if isTempl {
@@ -143,6 +150,11 @@ let installData in Infra = fn(.kw, remotePath, dataTmp) {
     }
     --depth;
     if updated {
+        if !perms.empty() {
+            ++depth;
+            self.chmod(kw..., remotePath, perms);
+            --depth;
+        }
         io.cprintln(prefix(), ' {g}installed {c}', remotePath, '{0}');
     } else {
         io.cprintln(prefix(), ' {g}already up to date {c}', remotePath, '{0}');
@@ -464,6 +476,7 @@ let run in Infra = fn(.kw, command...) {
     if desc != nil {
         io.cprint(prefix(), ' {y}', desc, ' {0}... ');
         if out == nil { io.cprintln(); }
+        else { io.fflush(io.stdout); }
     }
     expect(nl = out != nil, self.exec(kw..., command...), 0);
     if desc != nil {
@@ -488,6 +501,12 @@ let execOut in Infra = fn(.kw, command...) {
     let val = '';
     expect(self.exec(kw..., out = val, command...), 0);
     return val;
+};
+
+let rsync in Infra = fn(.kw, src, dest) {
+    let val = '';
+    return self.run(kw..., out = val, desc = 'syncing {0}`{c}' + src.str() + '{0}`{y} -> {0}`{c}' + dest.str() + '{0}`',
+                    'rsync', '-q', '-u', '-p', '-m', '-a', '-z', '-r', src.str(), dest.str());
 };
 
 let getDistro in Infra = fn() { return self.distro; };

@@ -9,4 +9,4 @@ let pkg = package.new(
     author = vec.new('Chirag-Khandelwal <github@mail.chiragkh.me>')
 );
 
-pkg.requires('SSH', '>=0.1.0', isFeral = true);
+pkg.requires('SSH', version = '>=0.1.0', feral = true);

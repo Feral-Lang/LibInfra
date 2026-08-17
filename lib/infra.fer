@@ -3,7 +3,6 @@ let fs = import('std/fs');
 let os = import('std/os');
 let vec = import('std/vec');
 let json = import('std/json');
-let result = import('std/result');
 let logging = import('std/logging');
 
 let ssh = import('ssh/ssh');
@@ -44,13 +43,13 @@ let expect = fn(.kw, res, val = nil) {
     let nl = ref(kw['nl']) ?? true;
     if !res.isOk() {
         if nl { io.cprintln('{r}failed{0}'); }
-        raise('error (', res.getVal().getCode(), '): ', res.getVal().getMsg());
+        raise('error (', res.val().code(), '): ', res.val().msg());
     }
-    if val != nil && res.getVal() != val {
+    if val != nil && res.val() != val {
         if nl { io.cprintln('{r}failed{0}'); }
-        raise('in result, expected `', val, '`, found `', res.getVal(), '`');
+        raise('in result, expected `', val, '`, found `', res.val(), '`');
     }
-    return res.getVal();
+    return res.val();
 };
 
 let prefix = fn() {
@@ -285,7 +284,7 @@ let walkDir in Infra = fn(.kw, path, regex = '', recursive = true) {
     let fileOnly = kw['fileOnly'] ?? false;
     let exists = self.exists(kw..., show = false, path);
     if !exists {
-        expect(nl = false, result.err(-1, 'path doesn\'t exist'));
+        expect(nl = false, feral.err(-1, 'path doesn\'t exist'));
     }
     let cmd = 'find ' + path.str();
     if !recursive {
@@ -313,7 +312,7 @@ let stat in Infra = fn(.kw, path) {
     if show { io.cprint(prefix(), ' {y}getting stat info for {c}', path, ' {0}... '); }
     let exists = self.exists(kw..., show = false, path);
     if !exists {
-        expect(nl = false, result.err(-1, 'path doesn\'t exist'));
+        expect(nl = false, feral.err(-1, 'path doesn\'t exist'));
     }
     let statDataStr = self.execOut(kw..., 'stat', '--format="%n %s %a %Y %U %u %G %g"', path.str());
     let st = statDataStr.split(' ');

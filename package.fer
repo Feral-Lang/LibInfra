@@ -1,12 +1,16 @@
 let vec = import('std/vec');
 let package = import('std/package');
 
-let pkg = package.new(
-    name = 'Infra',
-    desc = 'Infrastructure as Code - write Feral scripts to setup remote machines.',
-    version = '0.1.0',
-    feral = '>=2.1.1',
-    author = vec.new('Chirag-Khandelwal <github@mail.chiragkh.me>')
-);
+let configure = fn(info) {
+    let pkg = package.new(
+        'Infra',
+        desc = 'Infrastructure as Code - write Feral scripts to setup remote machines.',
+        version = '0.2.0',
+        feral = '>=2.4.1',
+        author = vec.new('Chirag-Khandelwal <github@mail.chiragkh.me>')
+    );
 
-pkg.requires('SSH', version = '>=0.1.0', feral = true);
+    pkg.requires('SSH', version = '~0.2.0', feral = true);
+
+    return feral.ok(pkg);
+};

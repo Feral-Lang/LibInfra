@@ -8,10 +8,10 @@ let argparse = import('std/argparse');
 let infra = import('infra/infra');
 
 let args = argparse.new(feral.args);
-args.addArg('trace').addOpts('--trace', '-T').setHelp('Show trace output');
-args.addArg('host').setValReqd(true).setReqd(true).setHelp('Hostname to connect to');
-args.addArg('port').setValReqd(true).setHelp('Port on the host to connect to');
-args.parse();
+args.addFlag('trace').addOpts('--trace', '-T').setHelp('Show trace output');
+args.addPos('host').setReqd(true).setHelp('Hostname to connect to');
+args.addPos('port').setHelp('Port on the host to connect to');
+args.parse(feral.args);
 
 if args.has('trace') {
     logging.addTarget(io.stderr, logging.Levels.TRACE);
@@ -25,6 +25,11 @@ let userHome = conn.getEnv('HOME');
 let rootHome = conn.getEnv(su = true, 'HOME');
 let homes = vec.new(refs = true, userHome, rootHome);
 
+io.println('--------------------------------- env --------------------------------');
+conn.setEnv('tmpEnvVar', 'tmpValue');
+let val = conn.getEnv('tmpEnvVar');
+io.println('tmpEnvVar = ', val);
+io.println('----------------------------------------------------------------------');
 let zshrc = userHome / '.zshrc';
 let zshrcExists = conn.exists(zshrc);
 let data = conn.readFile(zshrc);
@@ -71,12 +76,12 @@ for e in entries.each() {
 
 #################################### install ####################################
 
-let localPath = __SRC_DIR__ / 'include';
-let remotePath = userHome / 'include';
+let localPath = __SRC_DIR__ / '..' / 'lib';
+let remotePath = userHome / 'lib';
 
 conn.install(trunc = true, localPath, remotePath);
 conn.install(trunc = true, localPath, remotePath);
-conn.remove(userHome / 'include');
+conn.remove(userHome / 'lib');
 
 ################################### download ####################################
 

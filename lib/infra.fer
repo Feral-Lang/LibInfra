@@ -176,6 +176,16 @@ let getEnv in Infra = fn(.kw, var) {
     return val;
 };
 
+let setEnv in Infra = fn(.kw, var, val) {
+    let show = kw['show'] ?? true;
+    if show { io.cprint(prefix(), ' {y}setting env variable {c}', var, ' {0}... '); }
+    expect(self.exec(kw..., 'export', var + '=\'' + val.str(), '\''), 0);
+    if show {
+        io.cprintln('{g}done{0}');
+    }
+    return true;
+};
+
 let exists in Infra = fn(.kw, path) {
     let show = kw['show'] ?? true;
     if show { io.cprint(prefix(), ' {y}checking if path {c}', path, ' {y}exists', ' {0}... '); }

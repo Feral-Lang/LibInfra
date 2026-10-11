@@ -8,9 +8,9 @@ deps = [
     },
     {
         isFeral = true;
-        sha256 = "e830efa55bf69de7afdadad4609c4c55a409f6c1f2ee3ae6b251925210fd6f75";
-        url = "https://github.com/Feral-Lang/LibSSH/archive/refs/tags/0.2.0.tar.gz";
-        constraint = ">=0.2.0,<0.3.0";
+        sha256 = "93f69249924e02cec6575020652d83bb8bc291472676dfad2f357322488a87d9";
+        url = "https://github.com/Feral-Lang/LibSSH/archive/refs/tags/0.2.1.tar.gz";
+        constraint = ">=0.2.1,<0.3.0";
         name = "SSH";
     }
 ];

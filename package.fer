@@ -5,12 +5,12 @@ let configure = fn(info) {
     let pkg = package.new(
         'Infra',
         desc = 'Infrastructure as Code - write Feral scripts to setup remote machines.',
-        version = '0.2.0',
-        feral = '>=2.4.1',
+        version = '0.2.1',
+        feral = '>=2.6.0',
         author = vec.new('Chirag-Khandelwal <github@mail.chiragkh.me>')
     );
 
-    pkg.requires('SSH', version = '~0.2.0', feral = true);
+    pkg.requires('SSH', version = '~0.2.1', feral = true);
 
     return feral.ok(pkg);
 };
